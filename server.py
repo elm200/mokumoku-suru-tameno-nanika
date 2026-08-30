@@ -2,7 +2,9 @@ import base64
 import binascii
 import hmac
 import os
+import queue
 import random
+import threading
 import time
 import urllib.request
 import json as _json
@@ -99,6 +101,35 @@ def add_system_message(text):
     })
     post_to_discord(text)
 
+# Discord連携の現在状態: off=URL未設定 / on=設定済み / error=直近の送信が失敗(URL失効など)
+def get_discord_status():
+    if not DISCORD_WEBHOOK_URL:
+        return "off"
+    return "error" if discord_last_ok is False else "on"
+
+# SSE購読者(/events に接続中の各クライアント用キュー)。書き込み系ルートの最後にbroadcast()を呼んで配信する
+subscribers_lock = threading.Lock()
+subscribers = set()
+
+def snapshot():
+    return {
+        "messages": messages,
+        "board": list(board.values()),
+        "status": {"discord": get_discord_status()},
+    }
+
+def broadcast():
+    data = _json.dumps(snapshot())
+    with subscribers_lock:
+        dead = []
+        for q in subscribers:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            subscribers.discard(q)
+
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
@@ -124,16 +155,36 @@ def chara_custom(cid):
                     headers={"X-Content-Type-Options": "nosniff",
                              "Cache-Control": "public, max-age=86400"})
 
-# Discord連携の現在状態: off=URL未設定 / on=設定済み / error=直近の送信が失敗(URL失効など)
 @app.route("/status")
 def get_status():
-    if not DISCORD_WEBHOOK_URL:
-        discord = "off"
-    elif discord_last_ok is False:
-        discord = "error"
-    else:
-        discord = "on"
-    return jsonify({"discord": discord})
+    return jsonify({"discord": get_discord_status()})
+
+# 状態変化をプッシュ配信するSSEエンドポイント。接続直後に現在の全状態を1回送り、
+# 以後は書き込み系ルートがbroadcast()した時点の全状態を都度配信する
+@app.route("/events")
+def sse_events():
+    q = queue.Queue(maxsize=10)
+    with subscribers_lock:
+        subscribers.add(q)
+
+    def gen():
+        try:
+            yield f"data: {_json.dumps(snapshot())}\n\n"
+            while True:
+                try:
+                    data = q.get(timeout=15)
+                    yield f"data: {data}\n\n"
+                except queue.Empty:
+                    # プロキシ(cloudflaredなど)やブラウザ側のアイドルタイムアウトによる切断を防ぐ
+                    yield ": keep-alive\n\n"
+        finally:
+            with subscribers_lock:
+                subscribers.discard(q)
+
+    return Response(gen(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
 
 @app.route("/messages", methods=["GET"])
 def get_messages():
@@ -156,6 +207,7 @@ def post_message():
     }
     messages.append(msg)
     post_to_discord(f"**{name}**: {text}")
+    broadcast()
     return jsonify(msg), 201
 
 @app.route("/board", methods=["GET"])
@@ -204,6 +256,7 @@ def join_board():
     if is_new:
         until = f"〜{end}" if end else "〜"
         add_system_message(f"🟢 {name} がルーム{room}に入室してもくもく開始({start}{until}): {task}")
+    broadcast()
     return jsonify(board[cid]), 201
 
 @app.route("/board/leave", methods=["POST"])
@@ -227,9 +280,12 @@ def leave_board():
     # 人間可読かつ機械処理しやすい固定順の1行記録
     record = f"{now.strftime('%Y-%m-%d')} | {entry['start']}〜{end_str} | {minutes}分 | {entry['task']}"
     add_system_message(f"🔴 {entry['name']} がルーム{entry['room']}から退室")
+    broadcast()
     return jsonify({"ok": True, "record": record})
 
 if __name__ == "__main__":
     from waitress import serve
     print("もくもくサーバー起動: http://127.0.0.1:5000 (停止は Ctrl+C)", flush=True)
-    serve(app, host="127.0.0.1", port=5000)
+    # SSE接続は張りっぱなしでスレッドを1本占有し続けるため、既定の4スレッドでは閲覧者が数人いるだけで
+    # 書き込みAPIがブロックされる。部屋数(9)+閲覧のみのユーザーを見込んで余裕を持たせる
+    serve(app, host="127.0.0.1", port=5000, threads=32)

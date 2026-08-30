@@ -656,13 +656,16 @@
       discordStatusEl.className = status.discord;
     }
 
-    async function poll() {
-      try {
-        const [msgRes, boardRes, statusRes] = await Promise.all([fetch("/messages"), fetch("/board"), fetch("/status")]);
-        render(await msgRes.json());
-        renderBoard(await boardRes.json());
-        renderStatus(await statusRes.json());
-      } catch {}
+    function connectEvents() {
+      const es = new EventSource("/events");
+      es.onmessage = e => {
+        const data = JSON.parse(e.data);
+        render(data.messages);
+        renderBoard(data.board);
+        renderStatus(data.status);
+      };
+      // EventSourceは切断時にブラウザが自動再接続するので、ここではログのみ
+      es.onerror = () => console.warn("SSE接続エラー(自動再接続を待機)");
     }
 
     taskEl.addEventListener("input", () => {
@@ -692,7 +695,6 @@
       if (!result) return;
       textEl.value = "";
       textEl.style.height = "auto";
-      await poll();
     });
 
     joinBtn.addEventListener("click", async () => {
@@ -729,7 +731,6 @@
       if (!wasEditing && !textEl.value) {
         textEl.value = `${task}でもくもくします`;
       }
-      await poll();
       textEl.focus();
     });
 
@@ -770,7 +771,6 @@
         recordText.value = result.record;
         recordRow.style.display = "flex";
       }
-      await poll();
     });
 
     copyBtn.addEventListener("click", async () => {
@@ -789,8 +789,7 @@
       recordRow.style.display = "none";
     });
 
-    poll();
-    setInterval(poll, 2000);
+    connectEvents();
   </script>
 </body>
 </html>
