@@ -32,7 +32,8 @@ class LimitUploadSizeMiddleware:
                     return
         await self.app(scope, receive, send)
 
-app = FastAPI()
+# 参加者に公開されるアプリなので、API仕様を晒すdocs/redoc/openapi.jsonは無効化する
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(LimitUploadSizeMiddleware)
 messages = []
 board = {}
