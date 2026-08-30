@@ -224,8 +224,8 @@ VPSにSSHでログインした状態で実行します。`server.py`（アプリ
 curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
 sudo dpkg -i /tmp/cloudflared.deb
 
-# 2. トンネルを開始
-cloudflared tunnel --url http://localhost:5000
+# 2. トンネルを開始(--protocol http2: 既定のQUICだと長時間接続が途中で切れることがあるため)
+cloudflared tunnel --protocol http2 --url http://localhost:5000
 ```
 
 **パターンB: nohup でバックグラウンド化（SSHセッション1つで完結、おすすめ）**
@@ -244,8 +244,8 @@ curl http://localhost:5000
 curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
 sudo dpkg -i /tmp/cloudflared.deb
 
-# 4. トンネルを開始
-cloudflared tunnel --url http://localhost:5000
+# 4. トンネルを開始(--protocol http2: 既定のQUICだと長時間接続が途中で切れることがあるため)
+cloudflared tunnel --protocol http2 --url http://localhost:5000
 ```
 
 - ログを見たいときは `tail -f server.log`

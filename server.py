@@ -1,22 +1,39 @@
+import asyncio
 import base64
 import binascii
 import hmac
 import os
-import queue
 import random
-import threading
 import time
 import urllib.request
 import json as _json
-from flask import Flask, request, jsonify, send_from_directory, Response
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 from datetime import datetime
 
 # サーバーのOSタイムゾーン(EC2は既定でUTC)に関わらず、入退室記録をJST(クライアント側の時刻)と揃える
 os.environ["TZ"] = "Asia/Tokyo"
 time.tzset()
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+MAX_CONTENT_LENGTH = 2 * 1024 * 1024
+
+# FlaskのMAX_CONTENT_LENGTHに相当。Content-Lengthヘッダーを見て巨大なリクエストボディを弾く
+class LimitUploadSizeMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            for name, value in scope.get("headers", []):
+                if name == b"content-length" and int(value) > MAX_CONTENT_LENGTH:
+                    response = JSONResponse({"error": "payload too large"}, status_code=413)
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+app = FastAPI()
+app.add_middleware(LimitUploadSizeMiddleware)
 messages = []
 board = {}
 # カスタムキャラ画像は board と同じライフサイクル(退室で破棄、再起動で消える)
@@ -40,6 +57,13 @@ def load_settings():
         print(f"[settings] {SETTINGS_FILE} を読めないためデフォルト(mode=very_easy)で動作: {e}")
         return {}
 
+# リクエストボディをJSONとして読む。不正なJSONでも500にせず空dict扱いにする(既存の必須項目チェックが400を返す)
+async def read_json_body(request: Request):
+    try:
+        return await request.json()
+    except Exception:
+        return {}
+
 # セキュリティモード(デフォルト: very_easy):
 #   none      … 認証なし(閲覧・書き込みとも自由)
 #   very_easy … 閲覧は自由。書き込み系(投稿/入室/退室)は部屋共通の合言葉が必要。
@@ -58,7 +82,7 @@ def check_passphrase(data):
         return None
     supplied = ((data or {}).get("passphrase") or "").strip()
     if not hmac.compare_digest(supplied.encode(), expected.encode()):
-        return jsonify({"error": "wrong passphrase", "authRequired": True}), 401
+        return JSONResponse({"error": "wrong passphrase", "authRequired": True}, status_code=401)
     return None
 
 # クライアントがcanvasで縮小・PNG化したデータURLを検証してPNGバイト列を返す。不正ならNone
@@ -92,14 +116,15 @@ def post_to_discord(content):
         discord_last_ok = False
         print(f"[Discord] error: {e}")
 
-def add_system_message(text):
+async def add_system_message(text):
     messages.append({
         "name": "",
         "text": text,
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "system": True,
     })
-    post_to_discord(text)
+    # urllib呼び出しはブロッキングなのでスレッドに逃がし、イベントループを止めない
+    await asyncio.to_thread(post_to_discord, text)
 
 # Discord連携の現在状態: off=URL未設定 / on=設定済み / error=直近の送信が失敗(URL失効など)
 def get_discord_status():
@@ -107,9 +132,8 @@ def get_discord_status():
         return "off"
     return "error" if discord_last_ok is False else "on"
 
-# SSE購読者(/events に接続中の各クライアント用キュー)。書き込み系ルートの最後にbroadcast()を呼んで配信する
-subscribers_lock = threading.Lock()
-subscribers = set()
+# WebSocket購読者(/ws に接続中の各クライアント)。書き込み系ルートの最後にbroadcast()を呼んで配信する
+subscribers: set[WebSocket] = set()
 
 def snapshot():
     return {
@@ -118,106 +142,95 @@ def snapshot():
         "status": {"discord": get_discord_status()},
     }
 
-def broadcast():
-    data = _json.dumps(snapshot())
-    with subscribers_lock:
-        dead = []
-        for q in subscribers:
-            try:
-                q.put_nowait(data)
-            except queue.Full:
-                dead.append(q)
-        for q in dead:
-            subscribers.discard(q)
+async def broadcast():
+    data = snapshot()
+    dead = []
+    for ws in subscribers:
+        try:
+            await ws.send_json(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        subscribers.discard(ws)
 
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
+@app.get("/")
+async def index():
+    return FileResponse("index.html")
 
 # 部屋の画像は config/settings.json の appearance.room_image で差し替え可能(再起動不要)
-@app.route("/room-image.png")
-def room_image():
+@app.get("/room-image.png")
+async def room_image():
     path = load_settings().get("appearance", {}).get("room_image") or "assets/room-image-1.png"
-    directory, filename = os.path.split(path)
-    return send_from_directory(directory or ".", filename)
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(path)
 
-@app.route("/chara-image.png")
-def chara_image():
-    return send_from_directory("assets", "chara-image-1.png")
+@app.get("/chara-image.png")
+async def chara_image():
+    return FileResponse("assets/chara-image-1.png")
 
 # インメモリdictの参照のみ(ファイルシステム非接触)。バージョン付きURLで配信するので長めにキャッシュ可
-@app.route("/chara-custom/<cid>.png")
-def chara_custom(cid):
+@app.get("/chara-custom/{cid}.png")
+async def chara_custom(cid: str):
     img = custom_images.get(cid)
     if not img:
-        return jsonify({"error": "not found"}), 404
-    return Response(img["data"], mimetype="image/png",
-                    headers={"X-Content-Type-Options": "nosniff",
-                             "Cache-Control": "public, max-age=86400"})
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(img["data"], media_type="image/png",
+                     headers={"X-Content-Type-Options": "nosniff",
+                              "Cache-Control": "public, max-age=86400"})
 
-@app.route("/status")
-def get_status():
-    return jsonify({"discord": get_discord_status()})
+@app.get("/status")
+async def get_status():
+    return JSONResponse({"discord": get_discord_status()})
 
-# 状態変化をプッシュ配信するSSEエンドポイント。接続直後に現在の全状態を1回送り、
+# 状態変化をプッシュ配信するWebSocketエンドポイント。接続直後に現在の全状態を1回送り、
 # 以後は書き込み系ルートがbroadcast()した時点の全状態を都度配信する
-@app.route("/events")
-def sse_events():
-    q = queue.Queue(maxsize=10)
-    with subscribers_lock:
-        subscribers.add(q)
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    subscribers.add(websocket)
+    try:
+        await websocket.send_json(snapshot())
+        while True:
+            # クライアントは何も送ってこない。切断検知のためだけに受信を回す
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        subscribers.discard(websocket)
 
-    def gen():
-        try:
-            yield f"data: {_json.dumps(snapshot())}\n\n"
-            while True:
-                try:
-                    data = q.get(timeout=15)
-                    yield f"data: {data}\n\n"
-                except queue.Empty:
-                    # プロキシ(cloudflaredなど)やブラウザ側のアイドルタイムアウトによる切断を防ぐ
-                    yield ": keep-alive\n\n"
-        finally:
-            with subscribers_lock:
-                subscribers.discard(q)
+@app.get("/messages")
+async def get_messages():
+    return JSONResponse(messages)
 
-    return Response(gen(), mimetype="text/event-stream", headers={
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-    })
-
-@app.route("/messages", methods=["GET"])
-def get_messages():
-    return jsonify(messages)
-
-@app.route("/messages", methods=["POST"])
-def post_message():
-    data = request.get_json()
+@app.post("/messages")
+async def post_message(request: Request):
+    data = await read_json_body(request)
     err = check_passphrase(data)
     if err:
         return err
     name = data.get("name", "").strip()
     text = data.get("text", "").strip()
     if not name or not text:
-        return jsonify({"error": "name and text required"}), 400
+        return JSONResponse({"error": "name and text required"}, status_code=400)
     msg = {
         "name": name,
         "text": text,
         "time": datetime.now().strftime("%H:%M"),
     }
     messages.append(msg)
-    post_to_discord(f"**{name}**: {text}")
-    broadcast()
-    return jsonify(msg), 201
+    await asyncio.to_thread(post_to_discord, f"**{name}**: {text}")
+    await broadcast()
+    return JSONResponse(msg, status_code=201)
 
-@app.route("/board", methods=["GET"])
-def get_board():
-    return jsonify(list(board.values()))
+@app.get("/board")
+async def get_board():
+    return JSONResponse(list(board.values()))
 
 # board はクライアントID(ブラウザごとに固定)をキーに持つ。名前は表示用で変更可
-@app.route("/board/join", methods=["POST"])
-def join_board():
-    data = request.get_json()
+@app.post("/board/join")
+async def join_board(request: Request):
+    data = await read_json_body(request)
     err = check_passphrase(data)
     if err:
         return err
@@ -225,7 +238,7 @@ def join_board():
     name = (data.get("name") or "").strip()
     task = (data.get("task") or "").strip()
     if not cid or not name or not task:
-        return jsonify({"error": "id, name and task required"}), 400
+        return JSONResponse({"error": "id, name and task required"}, status_code=400)
     start = (data.get("start") or "").strip() or datetime.now().strftime("%H:%M")
     end = (data.get("end") or "").strip()
     is_new = cid not in board
@@ -233,7 +246,7 @@ def join_board():
         used = {e["room"] for e in board.values()}
         free = [r for r in range(1, ROOM_COUNT + 1) if r not in used]
         if not free:
-            return jsonify({"roomFull": True}), 200
+            return JSONResponse({"roomFull": True})
         room = random.choice(free)
         pose = random.randint(0, 2)
     else:
@@ -241,13 +254,13 @@ def join_board():
         pose = board[cid]["pose"]
         old_name = board[cid]["name"]
         if old_name != name:
-            add_system_message(f"✏️ {old_name} が {name} に名前を変更")
+            await add_system_message(f"✏️ {old_name} が {name} に名前を変更")
     # 画像は任意。未送信なら既存のカスタム画像を維持(imgvはcustom_imagesから再計算)
     image = data.get("image")
     if image:
         raw = decode_chara_image(image)
         if raw is None:
-            return jsonify({"error": "invalid image"}), 400
+            return JSONResponse({"error": "invalid image"}, status_code=400)
         global _img_seq
         _img_seq += 1
         custom_images[cid] = {"data": raw, "v": _img_seq}
@@ -255,13 +268,13 @@ def join_board():
     board[cid] = {"id": cid, "name": name, "start": start, "end": end, "task": task, "room": room, "pose": pose, "imgv": imgv}
     if is_new:
         until = f"〜{end}" if end else "〜"
-        add_system_message(f"🟢 {name} がルーム{room}に入室してもくもく開始({start}{until}): {task}")
-    broadcast()
-    return jsonify(board[cid]), 201
+        await add_system_message(f"🟢 {name} がルーム{room}に入室してもくもく開始({start}{until}): {task}")
+    await broadcast()
+    return JSONResponse(board[cid], status_code=201)
 
-@app.route("/board/leave", methods=["POST"])
-def leave_board():
-    data = request.get_json()
+@app.post("/board/leave")
+async def leave_board(request: Request):
+    data = await read_json_body(request)
     err = check_passphrase(data)
     if err:
         return err
@@ -269,7 +282,7 @@ def leave_board():
     entry = board.pop(cid, None)
     custom_images.pop(cid, None)  # 画像はその入室の間だけ有効
     if not entry:
-        return jsonify({"ok": True})
+        return JSONResponse({"ok": True})
     now = datetime.now()
     end_str = now.strftime("%H:%M")
     try:
@@ -279,13 +292,11 @@ def leave_board():
         minutes = 0
     # 人間可読かつ機械処理しやすい固定順の1行記録
     record = f"{now.strftime('%Y-%m-%d')} | {entry['start']}〜{end_str} | {minutes}分 | {entry['task']}"
-    add_system_message(f"🔴 {entry['name']} がルーム{entry['room']}から退室")
-    broadcast()
-    return jsonify({"ok": True, "record": record})
+    await add_system_message(f"🔴 {entry['name']} がルーム{entry['room']}から退室")
+    await broadcast()
+    return JSONResponse({"ok": True, "record": record})
 
 if __name__ == "__main__":
-    from waitress import serve
+    import uvicorn
     print("もくもくサーバー起動: http://127.0.0.1:5000 (停止は Ctrl+C)", flush=True)
-    # SSE接続は張りっぱなしでスレッドを1本占有し続けるため、既定の4スレッドでは閲覧者が数人いるだけで
-    # 書き込みAPIがブロックされる。部屋数(9)+閲覧のみのユーザーを見込んで余裕を持たせる
-    serve(app, host="127.0.0.1", port=5000, threads=32)
+    uvicorn.run(app, host="127.0.0.1", port=5000)

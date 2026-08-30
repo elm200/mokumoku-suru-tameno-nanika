@@ -657,15 +657,17 @@
     }
 
     function connectEvents() {
-      const es = new EventSource("/events");
-      es.onmessage = e => {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onmessage = e => {
         const data = JSON.parse(e.data);
         render(data.messages);
         renderBoard(data.board);
         renderStatus(data.status);
       };
-      // EventSourceは切断時にブラウザが自動再接続するので、ここではログのみ
-      es.onerror = () => console.warn("SSE接続エラー(自動再接続を待機)");
+      // WebSocketはEventSourceと違いブラウザが自動再接続してくれないため、切断時に手動で再接続する
+      ws.onclose = () => setTimeout(connectEvents, 2000);
+      ws.onerror = () => ws.close();
     }
 
     taskEl.addEventListener("input", () => {

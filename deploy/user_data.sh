@@ -21,7 +21,9 @@ nohup venv/bin/python3 server.py > /var/log/mokumoku_server.log 2>&1 &
 curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
 dpkg -i /tmp/cloudflared.deb || apt-get install -f -y
 
-nohup cloudflared tunnel --url http://localhost:5000 > /var/log/tunnel_raw.log 2>&1 &
+# --protocol http2: 既定のQUICは長時間張りっぱなしの接続(WebSocketの/wsなど)が
+# "stream canceled by remote with error code 0" で断続的に切れる既知の問題があるため固定する
+nohup cloudflared tunnel --protocol http2 --url http://localhost:5000 > /var/log/tunnel_raw.log 2>&1 &
 
 : > /var/log/tunnel_url.log
 for i in $$(seq 1 60); do
