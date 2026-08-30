@@ -52,7 +52,7 @@
     .cell .chara {
       width: 33%;
       aspect-ratio: 2 / 3;
-      background-image: url("/chara-image.png");
+      background-image: url("/assets/chara-image-1.png");
       background-size: 900% 600%;
       background-repeat: no-repeat;
       image-rendering: pixelated;
@@ -193,6 +193,18 @@
 
     .entry .what {
       word-break: break-word;
+    }
+
+    #closedView {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 24px;
+      color: #666;
+      font-size: 1rem;
+      line-height: 1.8;
     }
 
     #messages {
@@ -409,7 +421,7 @@
 </head>
 <body>
   <div id="roomView">
-    <img src="/room-image.png" alt="ルーム一覧">
+    <img id="roomImage" src="/assets/room-image-1.png" alt="ルーム一覧">
     <div id="roomOverlay"></div>
   </div>
   <div id="main">
@@ -418,16 +430,20 @@
     <h2>いまもくもく中</h2>
     <div id="entries"><div class="empty">まだ誰ももくもくしていません</div></div>
   </div>
+  <div id="closedView" style="display: none;">
+    現在、もくもく会は休会中です。<br>
+    主催者が開会するまでお待ちください。
+  </div>
   <div id="messages"></div>
   <form id="form">
     <div class="row" id="joinRow">
       <div class="lines">
         <div class="row-line">
-          <input id="name" type="text" placeholder="名前">
+          <input id="name" type="text" placeholder="名前" maxlength="40">
           <span class="field"><label for="chara">キャラ画像(任意/未指定なら自動割当)</label><input id="chara" type="file" accept="image/*"></span>
         </div>
         <div class="row-line">
-          <input id="task" type="text" placeholder="もくもくする内容(ボードに載ります)">
+          <input id="task" type="text" placeholder="もくもくする内容(ボードに載ります)" maxlength="100">
           <span class="field"><label for="start">開始</label><input id="start" type="time"></span>
           <span class="field"><label for="end">終了予定</label><input id="end" type="time"></span>
         </div>
@@ -442,7 +458,7 @@
           <button type="button" id="editBtn">編集</button>
         </div>
         <div class="row-line">
-          <textarea id="text" placeholder="コメント (Shift+Enterで改行)" rows="1"></textarea>
+          <textarea id="text" placeholder="コメント (Shift+Enterで改行)" rows="1" maxlength="500"></textarea>
           <button type="submit">送信</button>
         </div>
       </div>
@@ -458,6 +474,10 @@
   </div>
 
   <script>
+    const roomViewEl = document.getElementById("roomView");
+    const roomImageEl = document.getElementById("roomImage");
+    const closedViewEl = document.getElementById("closedView");
+    const boardEl = document.getElementById("board");
     const messagesEl = document.getElementById("messages");
     const entriesEl = document.getElementById("entries");
     const form = document.getElementById("form");
@@ -489,11 +509,22 @@
     });
 
     // 本人識別用ID(ブラウザごとに固定)。名前は表示用なので変更しても別人にならない
-    // ※crypto.randomUUIDはLAN経由のhttpアクセス(非セキュアコンテキスト)では使えないため自前生成
+    // ※crypto.randomUUIDは非セキュアコンテキストでは使えないため自前生成
     let clientId = localStorage.getItem("mokumoku-id");
     if (!clientId) {
       clientId = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
       localStorage.setItem("mokumoku-id", clientId);
+    }
+
+    // 所有者トークン。clientIdはボードに載って全員に配信されるので、
+    // 「自分の入室である」ことの証明には使えない。こちらは誰にも配信されない。
+    // ※crypto.randomUUIDと違い、getRandomValuesは非セキュアコンテキストでも使える
+    let clientToken = localStorage.getItem("mokumoku-token");
+    if (!clientToken) {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      clientToken = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem("mokumoku-token", clientToken);
     }
     const roomOverlayEl = document.getElementById("roomOverlay");
 
@@ -506,10 +537,22 @@
       roomCells.push(cell);
     }
 
-    let lastCount = 0;
+    let lastMessagesState = "";
+
+    // 送信直後、サーバーのSSEスナップショットがまだ追いついていない間だけ画面に足しておく
+    // 自分宛の楽観的メッセージ。snapshotのメッセージ件数がbaseCountを超えたら
+    // (サーバー側に反映されたとみなし)差し込みをやめる。
+    let pendingMessages = [];
+    let lastSnapshotMessages = [];
+
+    function displayMessages() {
+      return [...lastSnapshotMessages, ...pendingMessages];
+    }
 
     function render(msgs) {
-      if (msgs.length === lastCount) return;
+      const state = JSON.stringify(msgs);
+      if (state === lastMessagesState) return;
+      lastMessagesState = state;
       messagesEl.innerHTML = "";
       msgs.forEach(m => {
         const div = document.createElement("div");
@@ -522,7 +565,6 @@
         }
         messagesEl.appendChild(div);
       });
-      lastCount = msgs.length;
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
@@ -544,7 +586,7 @@
         if (o.imgv) {
           // アップロードされたカスタム画像(imgvはキャッシュバスター兼差分検知用)
           chara.classList.add("custom");
-          chara.style.backgroundImage = `url(/chara-custom/${encodeURIComponent(o.id)}.png?v=${o.imgv})`;
+          chara.style.backgroundImage = `url(/api/chara-custom?id=${encodeURIComponent(o.id)}&v=${o.imgv})`;
         } else {
           const col = ((o.room - 1) % 3) * 3 + o.pose;
           const row = Math.floor((o.room - 1) / 3) * 2;
@@ -622,20 +664,41 @@
 
     // 書き込み系APIの共通処理。サーバーがvery easyモードのときは401が返るので、
     // そこで初めて合言葉を聞いてlocalStorageに保存し再送する(noneモードでは一切聞かない)。
-    // キャンセルまたは規定回数失敗ならnullを返す(呼び出し元は中断する)
+    // キャンセルまたは規定回数失敗ならnullを返す(呼び出し元は中断する)。
+    // 休会中に書き込みが飛んだ場合は{closed:true}が返るので、その場で知らせて中断する。
+    // 403は「この入室は別のブラウザのもの」。呼び出し元は一律に中断してよい。
     async function postJson(url, body) {
       for (let attempt = 0; attempt < 3; attempt++) {
         const passphrase = localStorage.getItem("mokumoku-passphrase") || "";
+        const payload = { ...body, token: clientToken };
+        if (passphrase) payload.passphrase = passphrase;
         const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(passphrase ? { ...body, passphrase } : body),
+          body: JSON.stringify(payload),
         });
-        if (res.status !== 401) return res.json();
-        localStorage.removeItem("mokumoku-passphrase");
-        const input = (prompt(passphrase ? "合言葉が違います。もう一度入力してください" : "合言葉を入力してください") || "").trim();
-        if (!input) return null;
-        localStorage.setItem("mokumoku-passphrase", input);
+        if (res.status === 401) {
+          localStorage.removeItem("mokumoku-passphrase");
+          const input = (prompt(passphrase ? "合言葉が違います。もう一度入力してください" : "合言葉を入力してください") || "").trim();
+          if (!input) return null;
+          localStorage.setItem("mokumoku-passphrase", input);
+          continue;
+        }
+        let result = null;
+        try { result = await res.json(); } catch {}
+        if (res.status === 403) {
+          alert("この入室はこのブラウザのものではありません。もう一度入室してください");
+          return null;
+        }
+        if (!res.ok) {
+          alert(result && result.error ? `送信に失敗しました: ${result.error}` : "送信に失敗しました");
+          return null;
+        }
+        if (result && result.closed) {
+          alert("現在は休会中です");
+          return null;
+        }
+        return result;
       }
       localStorage.removeItem("mokumoku-passphrase");
       alert("合言葉が違います");
@@ -648,21 +711,43 @@
       error: { label: "Discord投稿: エラー", title: "直近のDiscord投稿に失敗しました(Webhook URLが失効している可能性)" },
     };
 
-    function renderStatus(status) {
-      const badge = DISCORD_BADGES[status.discord];
+    function renderStatus(discord) {
+      const badge = DISCORD_BADGES[discord];
       if (!badge) return;
       discordStatusEl.textContent = badge.label;
       discordStatusEl.title = badge.title;
-      discordStatusEl.className = status.discord;
+      discordStatusEl.className = discord;
     }
 
-    async function poll() {
-      try {
-        const [msgRes, boardRes, statusRes] = await Promise.all([fetch("/messages"), fetch("/board"), fetch("/status")]);
-        render(await msgRes.json());
-        renderBoard(await boardRes.json());
-        renderStatus(await statusRes.json());
-      } catch {}
+    let lastRoomImage = "";
+
+    // config.open のオン/オフでビュー全体を切り替える。休会中は入退室・チャットのUIを隠す
+    function applySnapshot(snapshot) {
+      if (!snapshot.config.open) {
+        roomViewEl.style.display = "none";
+        boardEl.style.display = "none";
+        messagesEl.style.display = "none";
+        form.style.display = "none";
+        closedViewEl.innerHTML = CLOSED_MESSAGE_HTML;
+        closedViewEl.style.display = "flex";
+        return;
+      }
+      roomViewEl.style.display = "";
+      boardEl.style.display = "";
+      messagesEl.style.display = "";
+      form.style.display = "";
+      closedViewEl.style.display = "none";
+
+      if (snapshot.config.roomImage !== lastRoomImage) {
+        lastRoomImage = snapshot.config.roomImage;
+        roomImageEl.src = `/assets/${snapshot.config.roomImage}`;
+      }
+      lastSnapshotMessages = snapshot.messages;
+      // サーバー側の件数が送信時点(baseCount)を超えていれば、もう反映済みとみなして差し込みをやめる
+      pendingMessages = pendingMessages.filter(p => p.baseCount >= snapshot.messages.length);
+      render(displayMessages());
+      renderBoard(snapshot.board);
+      renderStatus(snapshot.discord);
     }
 
     taskEl.addEventListener("input", () => {
@@ -688,11 +773,18 @@
       const name = nameEl.value.trim();
       const text = textEl.value.trim();
       if (!name || !text) return;
-      const result = await postJson("/messages", { name, text });
-      if (!result) return;
+      // 楽観的表示: サーバーの応答(SSE反映は最大2秒後)を待たず、自分の投稿を即座に画面へ足す
+      const pending = { name, text, time: nowHHMM(), baseCount: lastSnapshotMessages.length };
+      pendingMessages.push(pending);
+      render(displayMessages());
       textEl.value = "";
       textEl.style.height = "auto";
-      await poll();
+      const result = await postJson("/api/messages", { text });
+      if (!result) {
+        // 失敗(合言葉キャンセル等): 楽観的に足した分を取り消す
+        pendingMessages = pendingMessages.filter(p => p !== pending);
+        render(displayMessages());
+      }
     });
 
     joinBtn.addEventListener("click", async () => {
@@ -710,14 +802,10 @@
           return;
         }
       }
-      const result = await postJson("/board/join", { id: clientId, name, task, start: startEl.value, end: endEl.value, ...(image && { image }) });
+      const result = await postJson("/api/board/join", { id: clientId, name, task, start: startEl.value, end: endEl.value, ...(image && { image }) });
       if (!result) return;
       if (result.roomFull) {
         alert("満室です。空きが出るまでお待ちください");
-        return;
-      }
-      if (result.error) {
-        alert("入室に失敗しました: " + result.error);
         return;
       }
       // 送信済みの画像はクリア(編集モードで再送しない=サーバー側で維持される)
@@ -729,7 +817,7 @@
       if (!wasEditing && !textEl.value) {
         textEl.value = `${task}でもくもくします`;
       }
-      await poll();
+      updateMyStatus();
       textEl.focus();
     });
 
@@ -761,7 +849,7 @@
 
     leaveBtn.addEventListener("click", async () => {
       if (!confirm("退室しますか？")) return;
-      const result = await postJson("/board/leave", { id: clientId });
+      const result = await postJson("/api/board/leave", { id: clientId });
       if (!result) return;
       taskEl.value = "";
       startEl.value = "";
@@ -770,13 +858,12 @@
         recordText.value = result.record;
         recordRow.style.display = "flex";
       }
-      await poll();
     });
 
     copyBtn.addEventListener("click", async () => {
       recordText.select();
       let ok = false;
-      // LAN経由のhttp(非セキュアコンテキスト)ではclipboard APIが使えないためexecCommandにフォールバック
+      // 非セキュアコンテキストではclipboard APIが使えないためexecCommandにフォールバック
       if (navigator.clipboard && window.isSecureContext) {
         try { await navigator.clipboard.writeText(recordText.value); ok = true; } catch {}
       }
@@ -789,8 +876,23 @@
       recordRow.style.display = "none";
     });
 
-    poll();
-    setInterval(poll, 2000);
+    // 初回接続まではclosedViewを流用して「読み込み中...」を出す(元のメッセージは休会時に復元する)
+    const CLOSED_MESSAGE_HTML = closedViewEl.innerHTML;
+    closedViewEl.textContent = "読み込み中...";
+    closedViewEl.style.display = "flex";
+    roomViewEl.style.display = "none";
+    boardEl.style.display = "none";
+    messagesEl.style.display = "none";
+    form.style.display = "none";
+
+    const es = new EventSource("/api/events");
+    es.onmessage = ev => {
+      try {
+        applySnapshot(JSON.parse(ev.data));
+      } catch {
+        // 壊れたイベントは無視し、次のイベントを待つ
+      }
+    };
   </script>
 </body>
 </html>

@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>もくもく会 管理画面</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: sans-serif;
+      background: #f5f5f5;
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .admin-card {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+      padding: 24px;
+      width: 100%;
+      max-width: 420px;
+    }
+
+    .admin-card h1 {
+      font-size: 1.2rem;
+      margin-bottom: 16px;
+    }
+
+    .admin-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .admin-header h1 { margin-bottom: 0; }
+
+    .admin-field {
+      margin-bottom: 14px;
+    }
+
+    .admin-field label {
+      display: block;
+      font-size: 0.85rem;
+      color: #666;
+      margin-bottom: 4px;
+    }
+
+    .admin-field input[type="text"],
+    .admin-field input[type="password"],
+    .admin-field select {
+      width: 100%;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.95rem;
+      outline: none;
+    }
+
+    .admin-field input:focus,
+    .admin-field select:focus {
+      border-color: #555;
+    }
+
+    .admin-row {
+      margin-bottom: 10px;
+    }
+
+    button {
+      background: #333;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+
+    button:hover { background: #555; }
+    button:disabled { opacity: 0.6; cursor: default; }
+
+    .admin-logout {
+      background: #fff;
+      color: #888;
+      border: 1px solid #ccc;
+      font-size: 0.85rem;
+      padding: 4px 10px;
+    }
+
+    .admin-logout:hover { background: #eee; }
+
+    .admin-error {
+      color: #c33;
+      font-size: 0.85rem;
+      margin-top: 8px;
+    }
+
+    .admin-status {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: bold;
+    }
+
+    .admin-status.open {
+      background: #e6f4ea;
+      color: #2e7d32;
+    }
+
+    .admin-status.closed {
+      background: #f1f1f1;
+      color: #888;
+    }
+
+    hr {
+      border: none;
+      border-top: 1px solid #eee;
+      margin: 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script>
+    const app = document.getElementById("app");
+
+    async function postJson(url, body) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      let data = null;
+      try { data = await res.json(); } catch {}
+      return { status: res.status, data };
+    }
+
+    function renderLoading() {
+      app.innerHTML = `<div class="admin-card">読み込み中...</div>`;
+    }
+
+    function renderLogin() {
+      app.innerHTML = `
+        <div class="admin-card">
+          <h1>もくもく会 管理画面</h1>
+          <form id="loginForm">
+            <div class="admin-field">
+              <label for="password">管理者パスワード</label>
+              <input id="password" type="password" autofocus>
+            </div>
+            <button type="submit">ログイン</button>
+            <div class="admin-error" id="loginError" style="display: none;"></div>
+          </form>
+        </div>
+      `;
+      const form = document.getElementById("loginForm");
+      const passwordEl = document.getElementById("password");
+      const errorEl = document.getElementById("loginError");
+      form.addEventListener("submit", async e => {
+        e.preventDefault();
+        errorEl.style.display = "none";
+        const { status, data } = await postJson("/api/admin/login", { password: passwordEl.value });
+        if (status !== 200) {
+          errorEl.textContent = data?.error || "ログインに失敗しました";
+          errorEl.style.display = "block";
+          return;
+        }
+        await refresh();
+      });
+    }
+
+    const ROOM_IMAGE_OPTIONS = ["room-image-1.png", "room-image-2.png"];
+
+    function renderSettings(config) {
+      const roomImageOptions = ROOM_IMAGE_OPTIONS
+        .map(name => `<option value="${name}" ${name === config.roomImage ? "selected" : ""}>${name}</option>`)
+        .join("");
+      app.innerHTML = `
+        <div class="admin-card">
+          <div class="admin-header">
+            <h1>もくもく会 管理画面</h1>
+            <button type="button" class="admin-logout" id="logoutBtn">ログアウト</button>
+          </div>
+          <p>
+            現在の状態:
+            <span class="admin-status ${config.open ? "open" : "closed"}" id="statusBadge">${config.open ? "開会中" : "休会中"}</span>
+          </p>
+          <div class="admin-row">
+            <button type="button" id="toggleSessionBtn">${config.open ? "休会にする" : "開会する"}</button>
+          </div>
+          <div class="admin-error" id="sessionError" style="display: none;"></div>
+
+          <hr>
+
+          <div class="admin-field">
+            <label for="passphrase">参加者の合言葉(空欄なら合言葉なしで書き込み可)</label>
+            <input id="passphrase" type="text" value="${escapeAttr(config.passphrase)}">
+          </div>
+          <div class="admin-field">
+            <label for="roomImage">部屋画像</label>
+            <select id="roomImage">${roomImageOptions}</select>
+          </div>
+          <div class="admin-field">
+            <label for="securityMode">セキュリティモード</label>
+            <select id="securityMode">
+              <option value="very_easy" ${config.securityMode === "very_easy" ? "selected" : ""}>very_easy(書き込みに合言葉が必要)</option>
+              <option value="none" ${config.securityMode === "none" ? "selected" : ""}>none(認証なし)</option>
+            </select>
+          </div>
+          <div class="admin-row">
+            <button type="button" id="saveBtn">設定を保存</button>
+          </div>
+          <div class="admin-error" id="saveError" style="display: none;"></div>
+        </div>
+      `;
+
+      document.getElementById("logoutBtn").addEventListener("click", async () => {
+        await postJson("/api/admin/logout");
+        renderLogin();
+      });
+
+      document.getElementById("toggleSessionBtn").addEventListener("click", async () => {
+        if (config.open && !confirm("休会にすると、現在のもくもく会のデータ(入室状況・チャット履歴)が消去されます。よろしいですか？")) {
+          return;
+        }
+        const sessionErrorEl = document.getElementById("sessionError");
+        sessionErrorEl.style.display = "none";
+        const { status, data } = await postJson("/api/admin/session", { open: !config.open });
+        if (status !== 200) {
+          sessionErrorEl.textContent = data?.error || "切り替えに失敗しました";
+          sessionErrorEl.style.display = "block";
+          return;
+        }
+        renderSettings(data);
+      });
+
+      document.getElementById("saveBtn").addEventListener("click", async () => {
+        const saveBtn = document.getElementById("saveBtn");
+        const saveErrorEl = document.getElementById("saveError");
+        saveErrorEl.style.display = "none";
+        saveBtn.disabled = true;
+        saveBtn.textContent = "保存中...";
+        const { status, data } = await postJson("/api/admin/settings", {
+          passphrase: document.getElementById("passphrase").value,
+          roomImage: document.getElementById("roomImage").value,
+          securityMode: document.getElementById("securityMode").value,
+        });
+        if (status !== 200) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "設定を保存";
+          saveErrorEl.textContent = data?.error || "保存に失敗しました";
+          saveErrorEl.style.display = "block";
+          return;
+        }
+        renderSettings(data);
+      });
+    }
+
+    function escapeAttr(s) {
+      return String(s ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    }
+
+    async function refresh() {
+      renderLoading();
+      const res = await fetch("/api/admin/settings");
+      if (res.status === 401) {
+        renderLogin();
+        return;
+      }
+      renderSettings(await res.json());
+    }
+
+    refresh();
+  </script>
+</body>
+</html>

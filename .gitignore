@@ -9,13 +9,9 @@ venv/
 # PMO管理ディレクトリ（非公開）
 pmo/
 
-# 設定ファイル（非公開）。サンプルだけはリポジトリに含める
-config/*
-!config/settings.sample.json
-
 # ユーザーデータ（非公開）
 data/
 *Zone.Identifier
 
-# EC2自動デプロイの実行中インスタンス情報（非公開・ローカル限定）
-deploy/.current_instance
+.vercel
+.env*
