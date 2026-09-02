@@ -247,15 +247,23 @@ async def get_chara_image(cid: str) -> str | None:
     return await redis_command(["GET", img_key(cid)])
 
 
-async def close_session() -> Config:
-    """休会にする。board上の全員分の入室データ・カスタム画像・メッセージを一括削除する"""
+async def _clear_session_data() -> None:
+    """board上の全員分の入室データ・カスタム画像・メッセージを一括削除する"""
     entries = await list_board()
     commands = [["DEL", img_key(e["id"])] for e in entries]
     commands.append(["DEL", KEYS["board"]])
     commands.append(["DEL", KEYS["messages"]])
     await redis_pipeline(commands)
+
+
+async def close_session() -> Config:
+    """休会にする"""
+    await _clear_session_data()
     return await set_config({"open": False})
 
 
 async def open_session() -> Config:
+    """開会にする。理論上は休会時点で空になっているはずだが、何らかの理由でデータが
+    残っていた場合に備えて、開会時にも同じ削除処理を通しておく"""
+    await _clear_session_data()
     return await set_config({"open": True})

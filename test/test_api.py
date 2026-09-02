@@ -240,5 +240,24 @@ class RoomImageTest(ApiTestCase):
         self.assertEqual(self.client.get("/api/admin/settings").json()["roomImage"], "room-image-2.png")
 
 
+class SessionLifecycleTest(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.login()
+
+    def test_opening_clears_leftover_board_and_messages(self):
+        # closeを経由せず、何らかの理由でboard/messagesにデータが残ったままの状態を再現する
+        self.open_session()
+        self.join("alice", "tok-alice")
+        self.say("tok-alice", "residual message")
+
+        res = self.client.post("/api/admin/session", json={"open": True})
+
+        self.assertEqual(res.status_code, 200)
+        snapshot = self.last_snapshot()
+        self.assertEqual(snapshot["board"], [])
+        self.assertEqual(snapshot["messages"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
